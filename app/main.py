@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from web3 import Web3
+from fastapi import FastAPI, HTTPException, Path
+from app.alchemy_client import get_asset_transfers
+from app.features import extract_wallet_features, validate_ethereum_address, WalletFeatures
 
 from app.alchemy_client import AlchemyOracle, NewWalletError, OracleDataError
 from app.config import ALCHEMY_API_KEY, SCORE_MIN
@@ -22,6 +24,29 @@ app = FastAPI(
 
 oracle = AlchemyOracle(api_key=ALCHEMY_API_KEY)
 
+
+app = FastAPI(title="DeFi Credit Scoring API", version="0.1.0")
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+@app.get("/wallet/{wallet_address}/features", response_model=WalletFeatures)
+async def get_wallet_features(
+    wallet_address: str = Path(..., description="Ethereum wallet hex address")
+):
+    try:
+        norm_address = validate_ethereum_address(wallet_address)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        raw_transfers = await get_asset_transfers(norm_address)
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"Blockchain provider error: {str(err)}")
+
+    features = extract_wallet_features(norm_address, raw_transfers)
+    return features
 
 class ScoreRequest(BaseModel):
     address: str = Field(..., description="Ethereum wallet address (0x-prefixed)")

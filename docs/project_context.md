@@ -77,3 +77,33 @@ defi-credit/
 ├── .gitignore
 ├── pytest.ini
 └── requirements.txt
+
+
+# Project Context & Progress
+
+## Pipeline Architecture (Task 1 Complete)
+The pipeline now follows a strictly decoupled model:
+1. Address Validation & Normalization
+2. On-Chain Asset Transfer Ingestion (Alchemy RPC API)
+3. Feature Engineering (`app/features.py`)
+4. Output Validation via Pydantic (`WalletFeatures`)
+5. FastAPI Endpoint Ingestion (`GET /wallet/{wallet_address}/features`)
+
+## Derived Feature Set
+- `wallet_address`
+- `transaction_count`
+- `first_transaction_timestamp` / `last_transaction_timestamp`
+- `wallet_age_days`
+- `activity_span_days`
+- `active_days`
+- `transactions_per_active_day`
+- `total_transaction_volume_eth`
+- `average_transaction_value_eth`
+- `median_transaction_value_eth`
+- `successful_transaction_count`
+- `failed_transaction_count`
+- `failed_transaction_ratio`
+
+## Limitations
+- Asset transfer endpoints do not reflect non-state-changing zero-value failed contract executions unless combined with raw transaction receipts.
+- Token values are currently calculated in native ETH terms; USD conversion requires oracle/price indexer integration.
