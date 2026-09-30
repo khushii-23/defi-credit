@@ -1,0 +1,1476 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
+
+from alchemy import Alchemy, Network
+from alchemy.exceptions import AlchemyError
+from web3 import Web3
+
+from app.config import MAX_TRANSFER_PAGES, TRANSFER_PAGE_SIZE
+from app.protocols import PROTOCOL_BY_ADDRESS
+from app.scoring import WalletMetrics
+
+# String categories: alchemy-sdk's ERC20 enum member is a 1-tuple because of a trailing comma.
+TRANSFER_CATEGORIES = ["external", "internal", "erc20"]
+
+NETWORK_BY_NAME = {
+    "eth-mainnet": Network.ETH_MAINNET,
+    "eth_mainnet": Network.ETH_MAINNET,
+}
+
+
+class OracleDataError(Exception):
+    """Raised when Alchemy cannot return wallet history."""
+
+
+class NewWalletError(Exception):
+    """Raised when the address has no on-chain history."""
+
+    def __init__(self, address: str) -> None:
+        self.address = address
+        super().__init__(f"Wallet {address} has no on-chain history")
+
+
+def _parse_timestamp(value: str) -> datetime:
+    cleaned = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(cleaned)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _transfer_counterparty(transfer: Any, wallet: str) -> Optional[str]:
+    wallet_lc = wallet.lower()
+    frm = getattr(transfer, "frm", "") or ""
+    to = getattr(transfer, "to", None) or ""
+    if frm.lower() == wallet_lc and to:
+        return to
+    if to.lower() == wallet_lc and frm:
+        return frm
+    return to or frm or None
+
+
+def _iter_transfers(payload: dict) -> Iterable[Any]:
+    return payload.get("transfers") or []
+
+
+class AlchemyOracle:
+    def __init__(self, api_key: str, network: Network = Network.ETH_MAINNET) -> None:
+        self.client = Alchemy(api_key=api_key, network=network, max_retries=3)
+
+    def _first_transfer_time(
+        self, address: str, *, inbound: bool
+    ) -> Optional[datetime]:
+        kwargs: dict[str, Any] = {
+            "category": TRANSFER_CATEGORIES,
+            "with_metadata": True,
+            "from_block": "0x0",
+            "order": "asc",
+            "max_count": 1,
+            "exclude_zero_value": False,
+        }
+        if inbound:
+            kwargs["to_address"] = address
+        else:
+            kwargs["from_address"] = address
+
+        try:
+            result = self.client.core.get_asset_transfers(**kwargs)
+        except AlchemyError as exc:
+            raise OracleDataError(str(exc)) from exc
+
+        transfers = list(_iter_transfers(result))
+        if not transfers:
+            return None
+        metadata = getattr(transfers[0], "metadata", None)
+        ts = getattr(metadata, "block_timestamp", None) if metadata else None
+        if not ts:
+            return None
+        return _parse_timestamp(ts)
+
+    def _paged_transfers(self, address: str, *, inbound: bool) -> list[Any]:
+        collected: list[Any] = []
+        page_key: Optional[str] = None
+        kwargs_base: dict[str, Any] = {
+            "category": TRANSFER_CATEGORIES,
+            "with_metadata": False,
+            "from_block": "0x0",
+            "order": "asc",
+            "max_count": TRANSFER_PAGE_SIZE,
+            "exclude_zero_value": False,
+        }
+        if inbound:
+            kwargs_base["to_address"] = address
+        else:
+            kwargs_base["from_address"] = address
+
+        for _ in range(MAX_TRANSFER_PAGES):
+            kwargs = dict(kwargs_base)
+            if page_key:
+                kwargs["page_key"] = page_key
+            try:
+                result = self.client.core.get_asset_transfers(**kwargs)
+            except AlchemyError as exc:
+                raise OracleDataError(str(exc)) from exc
+            page = list(_iter_transfers(result))
+            collected.extend(page)
+            page_key = result.get("page_key")
+            if not page_key:
+                break
+        return collected
+
+    def fetch_asset_transfers(self, address: str) -> list[dict]:
+        """
+        Fetch inbound and outbound asset transfers and convert
+        Alchemy SDK objects into plain dictionaries.
+        """
+
+        checksum = Web3.to_checksum_address(address)
+
+        outbound = self._paged_transfers(
+            checksum,
+            inbound=False,
+        )
+
+        inbound = self._paged_transfers(
+            checksum,
+            inbound=True,
+        )
+
+        transfers = outbound + inbound
+
+        normalized_transfers = []
+
+        for transfer in transfers:
+            metadata = getattr(
+                transfer,
+                "metadata",
+                None,
+            )
+
+            block_timestamp = None
+
+            if metadata:
+                block_timestamp = getattr(
+                    metadata,
+                    "block_timestamp",
+                    None,
+                )
+
+            normalized_transfers.append(
+                {
+                    "hash": getattr(transfer, "hash", None),
+                    "from": getattr(transfer, "frm", None),
+                    "to": getattr(transfer, "to", None),
+                    "asset": getattr(transfer, "asset", None),
+                    "value": getattr(transfer, "value", None),
+                    "category": getattr(transfer, "category", None),
+                    "metadata": {
+                        "blockTimestamp": block_timestamp,
+                    },
+                }
+            )
+
+        return normalized_transfers
+    def fetch_metrics(self, address: str) -> WalletMetrics:
+        checksum = Web3.to_checksum_address(address)
+
+        try:
+            nonce = self.client.core.get_transaction_count(checksum)
+        except Exception as exc:
+            raise OracleDataError(
+                f"Failed to read transaction count: {exc}"
+            ) from exc
+
+        first_out = self._first_transfer_time(
+            checksum,
+            inbound=False,
+        )
+
+        first_in = self._first_transfer_time(
+            checksum,
+            inbound=True,
+        )
+
+        firsts = [
+            ts
+            for ts in (first_out, first_in)
+            if ts is not None
+        ]
+
+        outbound = self._paged_transfers(
+            checksum,
+            inbound=False,
+        )
+
+        inbound = self._paged_transfers(
+            checksum,
+            inbound=True,
+        )
+
+        transfers = outbound + inbound
+
+        unique_hashes = {
+            getattr(t, "hash", None)
+            for t in transfers
+        }
+
+        unique_hashes.discard(None)
+
+        tx_count = max(
+            int(nonce),
+            len(unique_hashes),
+        )
+
+        if not firsts and tx_count == 0:
+            raise NewWalletError(checksum)
+
+        if firsts:
+            age_days = (
+                datetime.now(timezone.utc) - min(firsts)
+            ).total_seconds() / 86400
+        else:
+            age_days = 0.0
+
+        protocols: set[str] = set()
+        defi_hashes: set[str] = set()
+
+        for transfer in transfers:
+            counterparty = _transfer_counterparty(
+                transfer,
+                checksum,
+            )
+
+            if not counterparty:
+                continue
+
+            try:
+                keyed = Web3.to_checksum_address(
+                    counterparty
+                )
+            except ValueError:
+                continue
+
+            protocol = PROTOCOL_BY_ADDRESS.get(keyed)
+
+            if protocol:
+                protocols.add(protocol)
+
+                tx_hash = getattr(
+                    transfer,
+                    "hash",
+                    None,
+                )
+
+                if tx_hash:
+                    defi_hashes.add(tx_hash)
+
+        return WalletMetrics(
+            account_age_days=max(age_days, 0.0),
+            transaction_count=tx_count,
+            defi_interaction_count=len(defi_hashes),
+            protocols_used=tuple(sorted(protocols)),
+        )
+"""Canonical Ethereum mainnet DeFi contracts used for interaction counting."""
+
+from web3 import Web3
+
+# Protocol name -> list of checksummed contract addresses (routers, pools, vaults).
+DEFI_PROTOCOLS: dict[str, list[str]] = {
+    "uniswap": [
+        "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",  # V2 Router
+        "0xE592427A0AEce92De3Edee1F18E0157C05861564",  # V3 SwapRouter
+        "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",  # SwapRouter02
+        "0x3fC91A3afd70395Cc0961486e16744F775dE934D",  # Universal Router
+        "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",  # V2 Factory
+        "0x1F98431c8aD98523631AE4a59f267346ea31F984",  # V3 Factory
+    ],
+    "aave": [
+        "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9",  # V2 LendingPool
+        "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",  # V3 Pool
+        "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e",  # V3 Pool Addresses Provider
+    ],
+    "compound": [
+        "0x3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B",  # Comptroller
+        "0x4Ddc2D193948926D02f9B1fE9e1daa0718270ED5",  # cETH
+        "0xc3d688B66703497DAA19211EEd0468b4d5E0d3F8",  # Comet USDC
+        "0xA17581A9E3356d9A858b789D68B4d866e593aE94",  # Comet WETH
+    ],
+    "maker": [
+        "0x9759A6Ac90977b93B58547b4A71c78317f391A28",  # Join DAI
+        "0x35D1b3F3D7966A1DFe207aa4514C12a259A0492B",  # Vat
+        "0x373238337Bfe1146fb43CdC72ff81517AD956Bd6",  # DSR Manager
+        "0x4678f0a6958e4D2Bc4F1BAF7Bc52E8F3564f3fE4",  # Proxy Registry
+    ],
+    "curve": [
+        "0x99a58482EE7e1B2622a25D36DD65B09548e0836f",  # Router
+        "0x0000000022D53366457F9d5E68Ec105046FC4383",  # Address Provider
+        "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",  # 3pool
+    ],
+    "lido": [
+        "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84",  # stETH
+        "0x889edC2eDab5f40e902b864aD4d7AdE8E412F9B1",  # Withdrawal Queue
+        "0x888888888889758F76e7103c6CbF23ABbF58F946",  # CSM
+    ],
+    "oneinch": [
+        "0x1111111254EEB25477B68fb85Ed929f73A960582",  # Aggregation Router v5
+        "0x111111125421cA6dc452d289314280a0f8842A65",  # Aggregation Router v6
+    ],
+    "sushiswap": [
+        "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F",  # Router
+    ],
+    "balancer": [
+        "0xBA12222222228d8Ba445958a75a0704d566BF2C8",  # Vault
+    ],
+    "spark": [
+        "0xC13e21B648A5Ee794902342038FF3aDAB66BE987",  # Pool
+    ],
+    "morpho": [
+        "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",  # Morpho Blue
+    ],
+    "yearn": [
+        "0x50c1a2eA0a861A967D9d0FFE2AE4012c2E053804",  # Registry
+    ],
+}
+
+
+def build_protocol_lookup() -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for name, addresses in DEFI_PROTOCOLS.items():
+        for address in addresses:
+            lookup[Web3.to_checksum_address(address)] = name
+    return lookup
+
+
+PROTOCOL_BY_ADDRESS = build_protocol_lookup()
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+import re
+import statistics
+
+from pydantic import BaseModel, Field
+
+
+ETHEREUM_ADDRESS_REGEX = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+def validate_ethereum_address(address: str) -> str:
+    """Validate and normalize an Ethereum wallet address."""
+    if not address or not ETHEREUM_ADDRESS_REGEX.fullmatch(address):
+        raise ValueError(f"Invalid Ethereum address format: {address}")
+
+    return address.lower()
+
+
+class WalletFeatures(BaseModel):
+    wallet_address: str
+
+    # Transaction / activity features
+    unique_transaction_count: int = Field(default=0, ge=0)
+    asset_transfer_event_count: int = Field(default=0, ge=0)
+
+    first_transaction_timestamp: Optional[str] = None
+    last_transaction_timestamp: Optional[str] = None
+
+    wallet_age_days: float = Field(default=0.0, ge=0.0)
+    activity_span_days: float = Field(default=0.0, ge=0.0)
+    active_days: int = Field(default=0, ge=0)
+    transactions_per_active_day: float = Field(default=0.0, ge=0.0)
+
+    # Native ETH transfer features
+    total_native_eth_transfer_volume: float = Field(default=0.0, ge=0.0)
+    average_native_eth_transfer_value: float = Field(default=0.0, ge=0.0)
+    median_native_eth_transfer_value: float = Field(default=0.0, ge=0.0)
+
+    # Reproducibility
+    analysis_timestamp: str
+
+
+def extract_wallet_features(
+    wallet_address: str,
+    raw_transfers: List[Dict[str, Any]],
+    analysis_timestamp: Optional[datetime] = None,
+) -> WalletFeatures:
+    """
+    Convert raw Alchemy asset-transfer records into wallet-level features.
+
+    Important:
+    - transfer events are not treated as blockchain transactions
+    - unique transaction hashes are used for transaction count
+    - failed transaction status is not inferred from transfer data
+    - ETH volume refers only to native ETH transfers
+    - analysis_timestamp makes wallet-age calculations reproducible
+    """
+
+    normalized_address = validate_ethereum_address(wallet_address)
+
+    if analysis_timestamp is None:
+        analysis_timestamp = datetime.now(timezone.utc)
+
+    if analysis_timestamp.tzinfo is None:
+        analysis_timestamp = analysis_timestamp.replace(tzinfo=timezone.utc)
+
+    analysis_timestamp = analysis_timestamp.astimezone(timezone.utc)
+
+    analysis_timestamp_iso = analysis_timestamp.isoformat()
+
+    if not raw_transfers:
+        return WalletFeatures(
+            wallet_address=normalized_address,
+            analysis_timestamp=analysis_timestamp_iso,
+        )
+
+    valid_timestamps: List[datetime] = []
+    native_eth_values: List[float] = []
+    distinct_dates = set()
+
+    transaction_hashes = set()
+
+    for transfer in raw_transfers:
+
+        # ---------------------------------------------------------
+        # Unique transaction hashes
+        # ---------------------------------------------------------
+        tx_hash = transfer.get("hash")
+
+        if tx_hash:
+            transaction_hashes.add(str(tx_hash).lower())
+
+        # ---------------------------------------------------------
+        # Timestamp
+        # ---------------------------------------------------------
+        metadata = transfer.get("metadata", {})
+
+        timestamp = None
+
+        if isinstance(metadata, dict):
+            timestamp = metadata.get("blockTimestamp")
+
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(
+                    str(timestamp).replace("Z", "+00:00")
+                )
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+
+                dt = dt.astimezone(timezone.utc)
+
+                valid_timestamps.append(dt)
+                distinct_dates.add(dt.date())
+
+            except (ValueError, TypeError):
+                pass
+
+        # ---------------------------------------------------------
+        # Native ETH transfer volume
+        # ---------------------------------------------------------
+        asset = transfer.get("asset")
+        value = transfer.get("value")
+
+        if asset == "ETH" and value is not None:
+            try:
+                eth_value = float(value)
+
+                if eth_value >= 0:
+                    native_eth_values.append(eth_value)
+
+            except (ValueError, TypeError):
+                pass
+
+    transfer_event_count = len(raw_transfers)
+    unique_transaction_count = len(transaction_hashes)
+
+    # -------------------------------------------------------------
+    # Timestamp calculations
+    # -------------------------------------------------------------
+    if valid_timestamps:
+
+        sorted_timestamps = sorted(valid_timestamps)
+
+        first_timestamp = sorted_timestamps[0]
+        last_timestamp = sorted_timestamps[-1]
+
+        first_timestamp_iso = first_timestamp.isoformat()
+        last_timestamp_iso = last_timestamp.isoformat()
+
+        wallet_age_days = max(
+            0.0,
+            (
+                analysis_timestamp - first_timestamp
+            ).total_seconds() / 86400.0,
+        )
+
+        activity_span_days = max(
+            0.0,
+            (
+                last_timestamp - first_timestamp
+            ).total_seconds() / 86400.0,
+        )
+
+    else:
+
+        first_timestamp_iso = None
+        last_timestamp_iso = None
+        wallet_age_days = 0.0
+        activity_span_days = 0.0
+
+    # -------------------------------------------------------------
+    # Activity calculations
+    # -------------------------------------------------------------
+    active_days = len(distinct_dates)
+
+    transactions_per_active_day = (
+        unique_transaction_count / active_days
+        if active_days > 0
+        else 0.0
+    )
+
+    # -------------------------------------------------------------
+    # Native ETH calculations
+    # -------------------------------------------------------------
+    total_eth_volume = (
+        sum(native_eth_values)
+        if native_eth_values
+        else 0.0
+    )
+
+    average_eth_value = (
+        total_eth_volume / len(native_eth_values)
+        if native_eth_values
+        else 0.0
+    )
+
+    median_eth_value = (
+        statistics.median(native_eth_values)
+        if native_eth_values
+        else 0.0
+    )
+
+    return WalletFeatures(
+        wallet_address=normalized_address,
+
+        unique_transaction_count=unique_transaction_count,
+        asset_transfer_event_count=transfer_event_count,
+
+        first_transaction_timestamp=first_timestamp_iso,
+        last_transaction_timestamp=last_timestamp_iso,
+
+        wallet_age_days=round(wallet_age_days, 2),
+        activity_span_days=round(activity_span_days, 2),
+        active_days=active_days,
+
+        transactions_per_active_day=round(
+            transactions_per_active_day,
+            2,
+        ),
+
+        total_native_eth_transfer_volume=round(
+            total_eth_volume,
+            6,
+        ),
+
+        average_native_eth_transfer_value=round(
+            average_eth_value,
+            6,
+        ),
+
+        median_native_eth_transfer_value=round(
+            median_eth_value,
+            6,
+        ),
+
+        analysis_timestamp=analysis_timestamp_iso,
+    )
+from pydantic import BaseModel, Field
+
+
+class ScoreBreakdown(BaseModel):
+    account_age: float = Field(ge=0, le=1)
+    transaction_count: float = Field(ge=0, le=1)
+    defi_interactions: float = Field(ge=0, le=1)
+
+
+class WalletMetricsResponse(BaseModel):
+    account_age_days: float
+    transaction_count: int
+    defi_interaction_count: int
+    protocols_used: list[str]
+
+
+class CreditScoreResponse(BaseModel):
+    address: str
+    score: int = Field(ge=300, le=850)
+    new_wallet: bool
+    metrics: WalletMetricsResponse
+    normalized: ScoreBreakdown
+    message: str | None = None
+
+
+class ErrorResponse(BaseModel):
+    detail: str
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from web3 import Web3
+from fastapi import FastAPI, HTTPException, Path
+from app.features import extract_wallet_features, validate_ethereum_address, WalletFeatures
+
+from app.alchemy_client import AlchemyOracle, NewWalletError, OracleDataError
+from app.config import ALCHEMY_API_KEY, SCORE_MIN
+from app.models import CreditScoreResponse, ErrorResponse, ScoreBreakdown, WalletMetricsResponse
+from app.scoring import (
+    WalletMetrics,
+    compute_score,
+    normalize_account_age,
+    normalize_defi_count,
+    normalize_tx_count,
+)
+
+
+oracle = AlchemyOracle(api_key=ALCHEMY_API_KEY)
+
+
+app = FastAPI(title="DeFi Credit Scoring API", version="0.1.0")
+
+
+@app.get(
+    "/wallet/{wallet_address}/features",
+    response_model=WalletFeatures,
+)
+def get_wallet_features(wallet_address: str):
+
+    try:
+        normalized_address = validate_ethereum_address(
+            wallet_address
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    try:
+        raw_transfers = oracle.fetch_asset_transfers(
+            normalized_address
+        )
+
+    except OracleDataError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Blockchain provider error: {exc}",
+        )
+
+    return extract_wallet_features(
+        normalized_address,
+        raw_transfers,
+    )
+class ScoreRequest(BaseModel):
+    address: str = Field(..., description="Ethereum wallet address (0x-prefixed)")
+
+
+def _validate_address(address: str) -> str:
+    if not Web3.is_address(address):
+        raise HTTPException(status_code=400, detail="Invalid Ethereum address")
+    return Web3.to_checksum_address(address)
+
+
+def _build_response(
+    address: str,
+    metrics: WalletMetrics,
+    *,
+    new_wallet: bool,
+    message: str | None = None,
+) -> CreditScoreResponse:
+    score = SCORE_MIN if new_wallet else compute_score(metrics)
+    return CreditScoreResponse(
+        address=address,
+        score=score,
+        new_wallet=new_wallet,
+        metrics=WalletMetricsResponse(
+            account_age_days=round(metrics.account_age_days, 4),
+            transaction_count=metrics.transaction_count,
+            defi_interaction_count=metrics.defi_interaction_count,
+            protocols_used=list(metrics.protocols_used),
+        ),
+        normalized=ScoreBreakdown(
+            account_age=round(normalize_account_age(metrics.account_age_days), 4),
+            transaction_count=round(normalize_tx_count(metrics.transaction_count), 4),
+            defi_interactions=round(
+                normalize_defi_count(metrics.defi_interaction_count), 4
+            ),
+        ),
+        message=message,
+    )
+
+
+def score_wallet(address: str) -> CreditScoreResponse:
+    checksum = _validate_address(address)
+    try:
+        metrics = oracle.fetch_metrics(checksum)
+    except NewWalletError:
+        empty = WalletMetrics(
+            account_age_days=0,
+            transaction_count=0,
+            defi_interaction_count=0,
+        )
+        return _build_response(
+            checksum,
+            empty,
+            new_wallet=True,
+            message="Wallet has no on-chain history; returning the minimum score of 300.",
+        )
+    except OracleDataError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _build_response(checksum, metrics, new_wallet=False)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get(
+    "/score/{address}",
+    response_model=CreditScoreResponse,
+    responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+def get_score(address: str) -> CreditScoreResponse:
+    return score_wallet(address)
+
+
+@app.post(
+    "/score",
+    response_model=CreditScoreResponse,
+    responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+def post_score(body: ScoreRequest) -> CreditScoreResponse:
+    return score_wallet(body.address)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import log1p
+
+from app.config import (
+    AGE_DAYS_CAP,
+    DEFI_COUNT_CAP,
+    SCORE_MAX,
+    SCORE_MIN,
+    TX_COUNT_CAP,
+    WEIGHT_ACCOUNT_AGE,
+    WEIGHT_DEFI,
+    WEIGHT_TX_COUNT,
+)
+
+
+@dataclass(frozen=True)
+class WalletMetrics:
+    account_age_days: float
+    transaction_count: int
+    defi_interaction_count: int
+    protocols_used: tuple[str, ...] = ()
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def normalize_account_age(days: float) -> float:
+    return _clamp01(days / AGE_DAYS_CAP)
+
+
+def normalize_tx_count(count: int) -> float:
+    # Log scale so a handful of txs still score, while whales saturate at the cap.
+    return _clamp01(log1p(count) / log1p(TX_COUNT_CAP))
+
+
+def normalize_defi_count(count: int) -> float:
+    return _clamp01(log1p(count) / log1p(DEFI_COUNT_CAP))
+
+
+def compute_score(metrics: WalletMetrics) -> int:
+    """Map normalized, weighted metrics onto the closed interval [300, 850]."""
+    if (
+        metrics.account_age_days <= 0
+        and metrics.transaction_count <= 0
+        and metrics.defi_interaction_count <= 0
+    ):
+        return SCORE_MIN
+
+    blended = (
+        WEIGHT_ACCOUNT_AGE * normalize_account_age(metrics.account_age_days)
+        + WEIGHT_TX_COUNT * normalize_tx_count(metrics.transaction_count)
+        + WEIGHT_DEFI * normalize_defi_count(metrics.defi_interaction_count)
+    )
+    raw = SCORE_MIN + (SCORE_MAX - SCORE_MIN) * blended
+    return int(round(max(SCORE_MIN, min(SCORE_MAX, raw))))
+from fastapi.testclient import TestClient
+
+from app.alchemy_client import NewWalletError, OracleDataError
+from app.main import app, oracle
+from app.scoring import WalletMetrics
+from datetime import datetime, timezone
+from app.features import WalletFeatures
+
+
+client = TestClient(app)
+
+
+def test_health():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_invalid_address_returns_400(monkeypatch):
+    response = client.get("/score/not-an-address")
+    assert response.status_code == 400
+    assert "Invalid Ethereum address" in response.json()["detail"]
+
+
+def test_new_wallet_returns_minimum_score(monkeypatch):
+    def _raise(_address: str):
+        raise NewWalletError("0x0000000000000000000000000000000000000001")
+
+    monkeypatch.setattr(oracle, "fetch_metrics", _raise)
+    address = "0x0000000000000000000000000000000000000001"
+    response = client.get(f"/score/{address}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["score"] == 300
+    assert body["new_wallet"] is True
+    assert body["metrics"]["transaction_count"] == 0
+    assert "no on-chain history" in body["message"]
+
+
+def test_scored_wallet_json_shape(monkeypatch):
+    metrics = WalletMetrics(
+        account_age_days=400,
+        transaction_count=80,
+        defi_interaction_count=12,
+        protocols_used=("aave", "uniswap"),
+    )
+    monkeypatch.setattr(oracle, "fetch_metrics", lambda _addr: metrics)
+    response = client.post(
+        "/score",
+        json={"address": "0x0000000000000000000000000000000000000001"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert 300 < body["score"] <= 850
+    assert body["new_wallet"] is False
+    assert body["metrics"]["protocols_used"] == ["aave", "uniswap"]
+    assert set(body["normalized"]) == {
+        "account_age",
+        "transaction_count",
+        "defi_interactions",
+    }
+
+
+def test_alchemy_failure_returns_502(monkeypatch):
+    def _raise(_address: str):
+        raise OracleDataError("upstream timeout")
+
+    monkeypatch.setattr(oracle, "fetch_metrics", _raise)
+    response = client.get("/score/0x0000000000000000000000000000000000000001")
+    assert response.status_code == 502
+    assert response.json()["detail"] == "upstream timeout"
+
+def test_features_endpoint(monkeypatch):
+
+    transfers = [
+        {
+            "hash": "0xabc",
+            "asset": "ETH",
+            "value": 1.5,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T10:00:00Z"
+            },
+        },
+        {
+            "hash": "0xabc",
+            "asset": "DAI",
+            "value": 100,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T10:00:00Z"
+            },
+        },
+    ]
+
+    monkeypatch.setattr(
+        oracle,
+        "fetch_asset_transfers",
+        lambda _address: transfers,
+    )
+
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    response = client.get(
+        f"/wallet/{address}/features"
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["unique_transaction_count"] == 1
+    assert body["asset_transfer_event_count"] == 2
+    assert body["total_native_eth_transfer_volume"] == 1.5
+
+
+def test_features_endpoint_invalid_address():
+
+    response = client.get(
+        "/wallet/not-a-real-address/features"
+    )
+
+    assert response.status_code == 400
+
+
+def test_features_endpoint_provider_failure(monkeypatch):
+
+    def _raise(_address):
+        raise OracleDataError(
+            "upstream timeout"
+        )
+
+    monkeypatch.setattr(
+        oracle,
+        "fetch_asset_transfers",
+        _raise,
+    )
+
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    response = client.get(
+        f"/wallet/{address}/features"
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "upstream timeout"
+    )
+import pytest
+from datetime import datetime, timezone
+
+from app.features import (
+    extract_wallet_features,
+    validate_ethereum_address,
+)
+
+
+def test_validate_ethereum_address_valid():
+    address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+    assert validate_ethereum_address(address) == address.lower()
+
+
+def test_validate_ethereum_address_invalid():
+    with pytest.raises(ValueError):
+        validate_ethereum_address(
+            "0xInvalidAddress12345"
+        )
+
+
+def test_empty_transfer_history():
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    analysis_time = datetime(
+        2026,
+        9,
+        30,
+        tzinfo=timezone.utc,
+    )
+
+    result = extract_wallet_features(
+        address,
+        [],
+        analysis_timestamp=analysis_time,
+    )
+
+    assert result.unique_transaction_count == 0
+    assert result.asset_transfer_event_count == 0
+    assert result.active_days == 0
+    assert result.wallet_age_days == 0.0
+    assert result.total_native_eth_transfer_volume == 0.0
+    assert result.analysis_timestamp == (
+        "2026-09-30T00:00:00+00:00"
+    )
+
+
+def test_unique_transaction_count_is_not_transfer_event_count():
+
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    raw_transfers = [
+
+        {
+            "hash": "0xabc",
+            "asset": "ETH",
+            "value": 1.0,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T10:00:00Z"
+            },
+        },
+
+        {
+            "hash": "0xabc",
+            "asset": "DAI",
+            "value": 100.0,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T10:00:00Z"
+            },
+        },
+
+        {
+            "hash": "0xdef",
+            "asset": "ETH",
+            "value": 2.0,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-02T12:00:00Z"
+            },
+        },
+    ]
+
+    analysis_time = datetime(
+        2026,
+        9,
+        30,
+        tzinfo=timezone.utc,
+    )
+
+    result = extract_wallet_features(
+        address,
+        raw_transfers,
+        analysis_timestamp=analysis_time,
+    )
+
+    # 3 transfer events
+    assert result.asset_transfer_event_count == 3
+
+    # But only 2 blockchain transactions
+    assert result.unique_transaction_count == 2
+
+    assert result.active_days == 2
+
+    assert result.transactions_per_active_day == 1.0
+
+
+def test_native_eth_volume_only():
+
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    raw_transfers = [
+
+        {
+            "hash": "0x111",
+            "asset": "ETH",
+            "value": 1.5,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T10:00:00Z"
+            },
+        },
+
+        {
+            "hash": "0x222",
+            "asset": "ETH",
+            "value": 2.5,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-02T12:00:00Z"
+            },
+        },
+
+        {
+            "hash": "0x333",
+            "asset": "DAI",
+            "value": 100.0,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-02T15:00:00Z"
+            },
+        },
+    ]
+
+    analysis_time = datetime(
+        2026,
+        9,
+        30,
+        tzinfo=timezone.utc,
+    )
+
+    result = extract_wallet_features(
+        address,
+        raw_transfers,
+        analysis_timestamp=analysis_time,
+    )
+
+    assert result.total_native_eth_transfer_volume == 4.0
+
+    assert result.average_native_eth_transfer_value == 2.0
+
+    assert result.median_native_eth_transfer_value == 2.0
+
+
+def test_analysis_timestamp_makes_wallet_age_reproducible():
+
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    raw_transfers = [
+        {
+            "hash": "0xabc",
+            "asset": "ETH",
+            "value": 1.0,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T00:00:00Z"
+            },
+        }
+    ]
+
+    analysis_time = datetime(
+        2026,
+        1,
+        11,
+        tzinfo=timezone.utc,
+    )
+
+    result = extract_wallet_features(
+        address,
+        raw_transfers,
+        analysis_timestamp=analysis_time,
+    )
+
+    assert result.wallet_age_days == 10.0
+from app.config import SCORE_MAX, SCORE_MIN
+from app.scoring import (
+    WalletMetrics,
+    compute_score,
+    normalize_account_age,
+    normalize_defi_count,
+    normalize_tx_count,
+)
+
+
+def test_new_wallet_scores_minimum():
+    metrics = WalletMetrics(
+        account_age_days=0, transaction_count=0, defi_interaction_count=0
+    )
+    assert compute_score(metrics) == SCORE_MIN
+
+
+def test_saturated_metrics_hit_max_score():
+    metrics = WalletMetrics(
+        account_age_days=10_000,
+        transaction_count=10_000,
+        defi_interaction_count=10_000,
+    )
+    assert compute_score(metrics) == SCORE_MAX
+
+
+def test_score_is_monotonic_in_each_feature():
+    base = WalletMetrics(
+        account_age_days=30, transaction_count=10, defi_interaction_count=2
+    )
+    older = WalletMetrics(
+        account_age_days=365, transaction_count=10, defi_interaction_count=2
+    )
+    busier = WalletMetrics(
+        account_age_days=30, transaction_count=200, defi_interaction_count=2
+    )
+    more_defi = WalletMetrics(
+        account_age_days=30, transaction_count=10, defi_interaction_count=40
+    )
+    floor = compute_score(base)
+    assert compute_score(older) > floor
+    assert compute_score(busier) > floor
+    assert compute_score(more_defi) > floor
+    assert SCORE_MIN < floor < SCORE_MAX
+
+
+def test_normalizers_are_bounded():
+    assert normalize_account_age(-1) == 0
+    assert normalize_account_age(0) == 0
+    assert normalize_account_age(10_000) == 1
+    assert 0 < normalize_tx_count(1) < 1
+    assert normalize_tx_count(0) == 0
+    assert normalize_defi_count(0) == 0
+    assert normalize_defi_count(10_000) == 1
+# DeFi Credit Scoring — Project Context
+
+## 1. Project Overview
+
+### Project Title
+DeFi Credit Scoring: An Explainable On-Chain Reputation System for Risk-Adjusted Lending
+
+### Project Type
+MSc Computer Science Research Project
+
+### Domain
+- Decentralized Finance (DeFi)
+- Blockchain Analytics
+- Credit/Risk Scoring
+- Machine Learning
+- Explainable AI
+- Smart Contract / On-Chain Data Analysis
+
+### Core Research Problem
+
+Traditional DeFi lending systems primarily rely on collateral to manage lending risk. This limits the ability to distinguish between borrowers based on their historical on-chain behavior.
+
+This project investigates whether historical blockchain activity of a wallet can be analyzed to generate an explainable reputation/credit score that can complement collateral-based lending decisions.
+
+The system is intended to analyze wallet behavior, extract meaningful features, assess risk, and generate a score that can be interpreted by users or integrated into a lending workflow.
+
+---
+
+## 2. Main Objective
+
+The main objective is to develop an explainable on-chain reputation and credit scoring system that:
+
+1. Collects relevant blockchain wallet activity.
+2. Processes and structures transaction data.
+3. Extracts behavioral and financial features.
+4. Calculates risk-related indicators.
+5. Generates a wallet-level credit/reputation score.
+6. Provides explanations for the generated score.
+7. Can potentially be used to support risk-adjusted DeFi lending.
+
+---
+
+## 3. Current Project Status
+
+### Current Phase
+
+Backend foundation / initial implementation.
+
+The repository currently contains the initial backend structure, configuration, blockchain API client, protocol definitions, scoring logic, API entry point, and basic tests.
+
+This is an evolving research project. Features should not be considered complete unless they are implemented in the repository.
+
+---
+
+## 4. Current Repository Structure
+
+```text
+defi-credit/
+│
+├── app/
+│   ├── alchemy_client.py
+│   ├── config.py
+│   ├── main.py
+│   ├── models.py
+│   ├── protocols.py
+│   └── scoring.py
+│
+├── tests/
+│   ├── test_api.py
+│   └── test_scoring.py
+│
+├── docs/
+│   ├── PROJECT_CONTEXT.md
+│   └── DECISIONS.md
+│
+├── .env.example
+├── .gitignore
+├── pytest.ini
+└── requirements.txt
+
+
+# Project Context & Progress
+
+## Pipeline Architecture (Task 1 Complete)
+The pipeline now follows a strictly decoupled model:
+1. Address Validation & Normalization
+2. On-Chain Asset Transfer Ingestion (Alchemy RPC API)
+3. Feature Engineering (`app/features.py`)
+4. Output Validation via Pydantic (`WalletFeatures`)
+5. FastAPI Endpoint Ingestion (`GET /wallet/{wallet_address}/features`)
+
+## Implemented Task 1 Features
+
+The current Task 1 pipeline extracts the following wallet-level features:
+
+- `unique_transaction_count`
+- `asset_transfer_event_count`
+- `first_transaction_timestamp`
+- `last_transaction_timestamp`
+- `wallet_age_days`
+- `activity_span_days`
+- `active_days`
+- `transactions_per_active_day`
+- `total_native_eth_transfer_volume`
+- `average_native_eth_transfer_value`
+- `median_native_eth_transfer_value`
+- `analysis_timestamp`
+
+### Important Methodological Notes
+
+`asset_transfer_event_count` and `unique_transaction_count` are intentionally separate.
+
+A single blockchain transaction may generate multiple asset-transfer events. Therefore, transfer-event count must not be interpreted as the number of blockchain transactions.
+
+Transaction success/failure is not currently included as a feature because the current asset-transfer data source does not provide sufficient receipt-level execution information to make that classification reliably.
+
+Native ETH volume features refer only to transfers where the asset is ETH. ERC-20 token values are not currently converted into ETH or USD.
+
+An explicit `analysis_timestamp` is used so that time-dependent features such as wallet age can be reproduced for a given analysis point.
+# DeFi Credit Scoring — System Architecture
+
+## 1. Overview
+
+This document describes the current and planned architecture of the DeFi Credit Scoring project.
+
+### Project
+
+**DeFi Credit Scoring: An Explainable On-Chain Reputation System for Risk-Adjusted Lending**
+
+The system is intended to analyze historical blockchain activity associated with a wallet, extract behavioral and risk-related features, and generate an explainable reputation/credit score that can potentially support risk-adjusted DeFi lending.
+
+The architecture is designed to keep blockchain data collection, data processing, scoring, API functionality, and future presentation layers separated.
+
+---
+
+# 2. High-Level Architecture
+
+The intended system architecture is:
+
+```text
+                    ┌──────────────────────┐
+                    │      Blockchain      │
+                    │   On-Chain Activity  │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │     Alchemy API      │
+                    │ Blockchain Data Layer│
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │   Data Processing    │
+                    │ & Data Normalization │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Feature Extraction  │
+                    │ Wallet-Level Features│
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │ Risk / Behavior      │
+                    │ Analysis             │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │   Scoring Engine     │
+                    │ Credit/Reputation    │
+                    │ Score Generation     │
+                    └──────────┬───────────┘
+                               │
+                     ┌─────────┴─────────┐
+                     ▼                   ▼
+          ┌──────────────────┐  ┌──────────────────┐
+          │ Explainability   │  │ Risk Assessment  │
+          │ / Score Factors  │  │ / Classification  │
+          └────────┬─────────┘  └────────┬─────────┘
+                   │                     │
+                   └──────────┬──────────┘
+                              ▼
+                    ┌──────────────────────┐
+                    │     FastAPI API      │
+                    │    Backend Layer     │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │ Future Web Dashboard │
+                    │ / External Consumer  │
+                    └──────────────────────┘
+
+---
+
+# `docs/DECISIONS.md`
+
+This one should be much more focused. **Don't put every tiny coding decision here.** Use it for decisions that future GPTs need to understand so they don't randomly change your architecture or research methodology.
+
+```markdown
+# Project Decisions
+
+This document records important technical, architectural, and research decisions made during the development of the DeFi Credit Scoring project.
+
+The purpose is to preserve project reasoning across development sessions and when working with different AI assistants.
+
+---
+
+## Decision Log
+
+---
+
+## D001 — Use GitHub as the Project Source of Truth
+
+**Date:** 2026-09-30
+
+**Decision:**
+
+The GitHub repository is the authoritative source for the current project implementation.
+
+Repository:
+
+`https://github.com/khushii-23/defi-credit`
+
+**Reason:**
+
+The project may be developed with different GPTs or development sessions. Keeping the implementation in GitHub allows different assistants to inspect the latest code instead of relying on previous conversation history.
+
+**Implication:**
+
+AI assistants should inspect the current repository before making assumptions about the implementation.
+
+---
+
+## D002 — Maintain a Dedicated Project Context Document
+
+**Date:** 2026-09-30
+
+**Decision:**
+
+Maintain project-level context in:
+
+```text
+docs/PROJECT_CONTEXT.md
