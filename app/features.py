@@ -1,126 +1,240 @@
-# app/features.py
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-import statistics
-from pydantic import BaseModel, Field, validator
+from typing import Any, Dict, List, Optional
 import re
+import statistics
+
+from pydantic import BaseModel, Field
+
 
 ETHEREUM_ADDRESS_REGEX = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
+
 def validate_ethereum_address(address: str) -> str:
-    """Validates and returns normalized lowercase Ethereum wallet address."""
-    if not address or not ETHEREUM_ADDRESS_REGEX.match(address):
+    """Validate and normalize an Ethereum wallet address."""
+    if not address or not ETHEREUM_ADDRESS_REGEX.fullmatch(address):
         raise ValueError(f"Invalid Ethereum address format: {address}")
+
     return address.lower()
+
 
 class WalletFeatures(BaseModel):
     wallet_address: str
-    transaction_count: int = Field(default=0, ge=0)
+
+    # Transaction / activity features
+    unique_transaction_count: int = Field(default=0, ge=0)
+    asset_transfer_event_count: int = Field(default=0, ge=0)
+
     first_transaction_timestamp: Optional[str] = None
     last_transaction_timestamp: Optional[str] = None
+
     wallet_age_days: float = Field(default=0.0, ge=0.0)
     activity_span_days: float = Field(default=0.0, ge=0.0)
     active_days: int = Field(default=0, ge=0)
     transactions_per_active_day: float = Field(default=0.0, ge=0.0)
-    total_transaction_volume_eth: float = Field(default=0.0, ge=0.0)
-    average_transaction_value_eth: float = Field(default=0.0, ge=0.0)
-    median_transaction_value_eth: float = Field(default=0.0, ge=0.0)
-    successful_transaction_count: int = Field(default=0, ge=0)
-    failed_transaction_count: int = Field(default=0, ge=0)
-    failed_transaction_ratio: float = Field(default=0.0, ge=0.0)
 
-def extract_wallet_features(wallet_address: str, raw_transfers: List[Dict[str, Any]]) -> WalletFeatures:
+    # Native ETH transfer features
+    total_native_eth_transfer_volume: float = Field(default=0.0, ge=0.0)
+    average_native_eth_transfer_value: float = Field(default=0.0, ge=0.0)
+    median_native_eth_transfer_value: float = Field(default=0.0, ge=0.0)
+
+    # Reproducibility
+    analysis_timestamp: str
+
+
+def extract_wallet_features(
+    wallet_address: str,
+    raw_transfers: List[Dict[str, Any]],
+    analysis_timestamp: Optional[datetime] = None,
+) -> WalletFeatures:
     """
-    Transforms raw Alchemy asset transfer records into structured, defensible features.
-    Handles zero-transaction edge cases, invalid timestamps, and division-by-zero safeguards.
+    Convert raw Alchemy asset-transfer records into wallet-level features.
+
+    Important:
+    - transfer events are not treated as blockchain transactions
+    - unique transaction hashes are used for transaction count
+    - failed transaction status is not inferred from transfer data
+    - ETH volume refers only to native ETH transfers
+    - analysis_timestamp makes wallet-age calculations reproducible
     """
-    norm_address = validate_ethereum_address(wallet_address)
-    
+
+    normalized_address = validate_ethereum_address(wallet_address)
+
+    if analysis_timestamp is None:
+        analysis_timestamp = datetime.now(timezone.utc)
+
+    if analysis_timestamp.tzinfo is None:
+        analysis_timestamp = analysis_timestamp.replace(tzinfo=timezone.utc)
+
+    analysis_timestamp = analysis_timestamp.astimezone(timezone.utc)
+
+    analysis_timestamp_iso = analysis_timestamp.isoformat()
+
     if not raw_transfers:
-        return WalletFeatures(wallet_address=norm_address)
+        return WalletFeatures(
+            wallet_address=normalized_address,
+            analysis_timestamp=analysis_timestamp_iso,
+        )
 
     valid_timestamps: List[datetime] = []
-    eth_volumes: List[float] = []
+    native_eth_values: List[float] = []
     distinct_dates = set()
-    successful_count = 0
-    failed_count = 0
 
-    for tx in raw_transfers:
-        # Check success status if available, default to successful for asset transfers
-        category = tx.get("category", "")
-        status = tx.get("status", "0x1")
-        if status == "0x0" or tx.get("isError") == "1":
-            failed_count += 1
-        else:
-            successful_count += 1
+    transaction_hashes = set()
 
-        # Parse timestamp
-        meta = tx.get("metadata", {})
-        ts_str = meta.get("blockTimestamp") if isinstance(meta, dict) else None
-        if ts_str:
+    for transfer in raw_transfers:
+
+        # ---------------------------------------------------------
+        # Unique transaction hashes
+        # ---------------------------------------------------------
+        tx_hash = transfer.get("hash")
+
+        if tx_hash:
+            transaction_hashes.add(str(tx_hash).lower())
+
+        # ---------------------------------------------------------
+        # Timestamp
+        # ---------------------------------------------------------
+        metadata = transfer.get("metadata", {})
+
+        timestamp = None
+
+        if isinstance(metadata, dict):
+            timestamp = metadata.get("blockTimestamp")
+
+        if timestamp:
             try:
-                # Handle ISO timestamps ending with Z or offset
-                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(
+                    str(timestamp).replace("Z", "+00:00")
+                )
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+
+                dt = dt.astimezone(timezone.utc)
+
                 valid_timestamps.append(dt)
                 distinct_dates.add(dt.date())
-            except ValueError:
-                pass
 
-        # Parse ETH asset volumes
-        asset = tx.get("asset")
-        value = tx.get("value")
-        if asset == "ETH" and value is not None:
-            try:
-                eth_val = float(value)
-                if eth_val >= 0:
-                    eth_volumes.append(eth_val)
             except (ValueError, TypeError):
                 pass
 
-    total_tx = len(raw_transfers)
-    
-    # Temporal Calculations
-    now_utc = datetime.now(timezone.utc)
+        # ---------------------------------------------------------
+        # Native ETH transfer volume
+        # ---------------------------------------------------------
+        asset = transfer.get("asset")
+        value = transfer.get("value")
+
+        if asset == "ETH" and value is not None:
+            try:
+                eth_value = float(value)
+
+                if eth_value >= 0:
+                    native_eth_values.append(eth_value)
+
+            except (ValueError, TypeError):
+                pass
+
+    transfer_event_count = len(raw_transfers)
+    unique_transaction_count = len(transaction_hashes)
+
+    # -------------------------------------------------------------
+    # Timestamp calculations
+    # -------------------------------------------------------------
     if valid_timestamps:
-        sorted_ts = sorted(valid_timestamps)
-        first_ts = sorted_ts[0]
-        last_ts = sorted_ts[-1]
-        
-        first_iso = first_ts.isoformat()
-        last_iso = last_ts.isoformat()
-        
-        wallet_age = max(0.0, (now_utc - first_ts).total_seconds() / 86400.0)
-        activity_span = max(0.0, (last_ts - first_ts).total_seconds() / 86400.0)
+
+        sorted_timestamps = sorted(valid_timestamps)
+
+        first_timestamp = sorted_timestamps[0]
+        last_timestamp = sorted_timestamps[-1]
+
+        first_timestamp_iso = first_timestamp.isoformat()
+        last_timestamp_iso = last_timestamp.isoformat()
+
+        wallet_age_days = max(
+            0.0,
+            (
+                analysis_timestamp - first_timestamp
+            ).total_seconds() / 86400.0,
+        )
+
+        activity_span_days = max(
+            0.0,
+            (
+                last_timestamp - first_timestamp
+            ).total_seconds() / 86400.0,
+        )
+
     else:
-        first_iso = None
-        last_iso = None
-        wallet_age = 0.0
-        activity_span = 0.0
 
-    active_days_cnt = len(distinct_dates)
-    tx_per_active_day = (total_tx / active_days_cnt) if active_days_cnt > 0 else 0.0
+        first_timestamp_iso = None
+        last_timestamp_iso = None
+        wallet_age_days = 0.0
+        activity_span_days = 0.0
 
-    # Volume Calculations
-    tot_vol = sum(eth_volumes) if eth_volumes else 0.0
-    avg_vol = (tot_vol / len(eth_volumes)) if eth_volumes else 0.0
-    med_vol = statistics.median(eth_volumes) if eth_volumes else 0.0
+    # -------------------------------------------------------------
+    # Activity calculations
+    # -------------------------------------------------------------
+    active_days = len(distinct_dates)
 
-    # Fail Ratio Calculation
-    fail_ratio = (failed_count / total_tx) if total_tx > 0 else 0.0
+    transactions_per_active_day = (
+        unique_transaction_count / active_days
+        if active_days > 0
+        else 0.0
+    )
+
+    # -------------------------------------------------------------
+    # Native ETH calculations
+    # -------------------------------------------------------------
+    total_eth_volume = (
+        sum(native_eth_values)
+        if native_eth_values
+        else 0.0
+    )
+
+    average_eth_value = (
+        total_eth_volume / len(native_eth_values)
+        if native_eth_values
+        else 0.0
+    )
+
+    median_eth_value = (
+        statistics.median(native_eth_values)
+        if native_eth_values
+        else 0.0
+    )
 
     return WalletFeatures(
-        wallet_address=norm_address,
-        transaction_count=total_tx,
-        first_transaction_timestamp=first_iso,
-        last_transaction_timestamp=last_iso,
-        wallet_age_days=round(wallet_age, 2),
-        activity_span_days=round(activity_span, 2),
-        active_days=active_days_cnt,
-        transactions_per_active_day=round(tx_per_active_day, 2),
-        total_transaction_volume_eth=round(tot_vol, 6),
-        average_transaction_value_eth=round(avg_vol, 6),
-        median_transaction_value_eth=round(med_vol, 6),
-        successful_transaction_count=successful_count,
-        failed_transaction_count=failed_count,
-        failed_transaction_ratio=round(fail_ratio, 4)
+        wallet_address=normalized_address,
+
+        unique_transaction_count=unique_transaction_count,
+        asset_transfer_event_count=transfer_event_count,
+
+        first_transaction_timestamp=first_timestamp_iso,
+        last_transaction_timestamp=last_timestamp_iso,
+
+        wallet_age_days=round(wallet_age_days, 2),
+        activity_span_days=round(activity_span_days, 2),
+        active_days=active_days,
+
+        transactions_per_active_day=round(
+            transactions_per_active_day,
+            2,
+        ),
+
+        total_native_eth_transfer_volume=round(
+            total_eth_volume,
+            6,
+        ),
+
+        average_native_eth_transfer_value=round(
+            average_eth_value,
+            6,
+        ),
+
+        median_native_eth_transfer_value=round(
+            median_eth_value,
+            6,
+        ),
+
+        analysis_timestamp=analysis_timestamp_iso,
     )

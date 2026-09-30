@@ -120,48 +120,149 @@ class AlchemyOracle:
                 break
         return collected
 
+    def fetch_asset_transfers(self, address: str) -> list[dict]:
+        """
+        Fetch inbound and outbound asset transfers and convert
+        Alchemy SDK objects into plain dictionaries.
+        """
+
+        checksum = Web3.to_checksum_address(address)
+
+        outbound = self._paged_transfers(
+            checksum,
+            inbound=False,
+        )
+
+        inbound = self._paged_transfers(
+            checksum,
+            inbound=True,
+        )
+
+        transfers = outbound + inbound
+
+        normalized_transfers = []
+
+        for transfer in transfers:
+            metadata = getattr(
+                transfer,
+                "metadata",
+                None,
+            )
+
+            block_timestamp = None
+
+            if metadata:
+                block_timestamp = getattr(
+                    metadata,
+                    "block_timestamp",
+                    None,
+                )
+
+            normalized_transfers.append(
+                {
+                    "hash": getattr(transfer, "hash", None),
+                    "from": getattr(transfer, "frm", None),
+                    "to": getattr(transfer, "to", None),
+                    "asset": getattr(transfer, "asset", None),
+                    "value": getattr(transfer, "value", None),
+                    "category": getattr(transfer, "category", None),
+                    "metadata": {
+                        "blockTimestamp": block_timestamp,
+                    },
+                }
+            )
+
+        return normalized_transfers
     def fetch_metrics(self, address: str) -> WalletMetrics:
         checksum = Web3.to_checksum_address(address)
 
         try:
             nonce = self.client.core.get_transaction_count(checksum)
         except Exception as exc:
-            raise OracleDataError(f"Failed to read transaction count: {exc}") from exc
+            raise OracleDataError(
+                f"Failed to read transaction count: {exc}"
+            ) from exc
 
-        first_out = self._first_transfer_time(checksum, inbound=False)
-        first_in = self._first_transfer_time(checksum, inbound=True)
-        firsts = [ts for ts in (first_out, first_in) if ts is not None]
+        first_out = self._first_transfer_time(
+            checksum,
+            inbound=False,
+        )
 
-        outbound = self._paged_transfers(checksum, inbound=False)
-        inbound = self._paged_transfers(checksum, inbound=True)
+        first_in = self._first_transfer_time(
+            checksum,
+            inbound=True,
+        )
+
+        firsts = [
+            ts
+            for ts in (first_out, first_in)
+            if ts is not None
+        ]
+
+        outbound = self._paged_transfers(
+            checksum,
+            inbound=False,
+        )
+
+        inbound = self._paged_transfers(
+            checksum,
+            inbound=True,
+        )
+
         transfers = outbound + inbound
 
-        unique_hashes = {getattr(t, "hash", None) for t in transfers}
+        unique_hashes = {
+            getattr(t, "hash", None)
+            for t in transfers
+        }
+
         unique_hashes.discard(None)
-        tx_count = max(int(nonce), len(unique_hashes))
+
+        tx_count = max(
+            int(nonce),
+            len(unique_hashes),
+        )
 
         if not firsts and tx_count == 0:
             raise NewWalletError(checksum)
 
         if firsts:
-            age_days = (datetime.now(timezone.utc) - min(firsts)).total_seconds() / 86400
+            age_days = (
+                datetime.now(timezone.utc) - min(firsts)
+            ).total_seconds() / 86400
         else:
             age_days = 0.0
 
         protocols: set[str] = set()
         defi_hashes: set[str] = set()
+
         for transfer in transfers:
-            counterparty = _transfer_counterparty(transfer, checksum)
+            counterparty = _transfer_counterparty(
+                transfer,
+                checksum,
+            )
+
             if not counterparty:
                 continue
+
             try:
-                keyed = Web3.to_checksum_address(counterparty)
+                keyed = Web3.to_checksum_address(
+                    counterparty
+                )
             except ValueError:
                 continue
+
             protocol = PROTOCOL_BY_ADDRESS.get(keyed)
+
             if protocol:
                 protocols.add(protocol)
-                tx_hash = getattr(transfer, "hash", None)
+
+                tx_hash = getattr(
+                    transfer,
+                    "hash",
+                    None,
+                )
+
                 if tx_hash:
                     defi_hashes.add(tx_hash)
 

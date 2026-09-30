@@ -2,7 +2,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from web3 import Web3
 from fastapi import FastAPI, HTTPException, Path
-from app.alchemy_client import get_asset_transfers
 from app.features import extract_wallet_features, validate_ethereum_address, WalletFeatures
 
 from app.alchemy_client import AlchemyOracle, NewWalletError, OracleDataError
@@ -16,38 +15,51 @@ from app.scoring import (
     normalize_tx_count,
 )
 
-app = FastAPI(
-    title="DeFi Credit Oracle",
-    description="Off-chain oracle that scores Ethereum wallets from Alchemy on-chain history.",
-    version="1.0.0",
-)
 
 oracle = AlchemyOracle(api_key=ALCHEMY_API_KEY)
 
 
 app = FastAPI(title="DeFi Credit Scoring API", version="0.1.0")
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
 
-@app.get("/wallet/{wallet_address}/features", response_model=WalletFeatures)
-async def get_wallet_features(
-    wallet_address: str = Path(..., description="Ethereum wallet hex address")
-):
-    try:
-        norm_address = validate_ethereum_address(wallet_address)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.get(
+    "/wallet/{wallet_address}/features",
+    response_model=WalletFeatures,
+)
+def get_wallet_features(wallet_address: str):
 
     try:
-        raw_transfers = await get_asset_transfers(norm_address)
-    except Exception as err:
-        raise HTTPException(status_code=502, detail=f"Blockchain provider error: {str(err)}")
+        normalized_address = validate_ethereum_address(
+            wallet_address
+        )
 
-    features = extract_wallet_features(norm_address, raw_transfers)
-    return features
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
 
+    try:
+        raw_transfers = oracle.fetch_asset_transfers(
+            normalized_address
+        )
+
+    except OracleDataError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Blockchain provider error: {exc}",
+        )
+
+    return extract_wallet_features(
+        normalized_address,
+        raw_transfers,
+    )
 class ScoreRequest(BaseModel):
     address: str = Field(..., description="Ethereum wallet address (0x-prefixed)")
 

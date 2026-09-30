@@ -89,21 +89,31 @@ The pipeline now follows a strictly decoupled model:
 4. Output Validation via Pydantic (`WalletFeatures`)
 5. FastAPI Endpoint Ingestion (`GET /wallet/{wallet_address}/features`)
 
-## Derived Feature Set
-- `wallet_address`
-- `transaction_count`
-- `first_transaction_timestamp` / `last_transaction_timestamp`
+## Implemented Task 1 Features
+
+The current Task 1 pipeline extracts the following wallet-level features:
+
+- `unique_transaction_count`
+- `asset_transfer_event_count`
+- `first_transaction_timestamp`
+- `last_transaction_timestamp`
 - `wallet_age_days`
 - `activity_span_days`
 - `active_days`
 - `transactions_per_active_day`
-- `total_transaction_volume_eth`
-- `average_transaction_value_eth`
-- `median_transaction_value_eth`
-- `successful_transaction_count`
-- `failed_transaction_count`
-- `failed_transaction_ratio`
+- `total_native_eth_transfer_volume`
+- `average_native_eth_transfer_value`
+- `median_native_eth_transfer_value`
+- `analysis_timestamp`
 
-## Limitations
-- Asset transfer endpoints do not reflect non-state-changing zero-value failed contract executions unless combined with raw transaction receipts.
-- Token values are currently calculated in native ETH terms; USD conversion requires oracle/price indexer integration.
+### Important Methodological Notes
+
+`asset_transfer_event_count` and `unique_transaction_count` are intentionally separate.
+
+A single blockchain transaction may generate multiple asset-transfer events. Therefore, transfer-event count must not be interpreted as the number of blockchain transactions.
+
+Transaction success/failure is not currently included as a feature because the current asset-transfer data source does not provide sufficient receipt-level execution information to make that classification reliably.
+
+Native ETH volume features refer only to transfers where the asset is ETH. ERC-20 token values are not currently converted into ETH or USD.
+
+An explicit `analysis_timestamp` is used so that time-dependent features such as wallet age can be reproduced for a given analysis point.

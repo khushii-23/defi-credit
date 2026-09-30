@@ -3,6 +3,8 @@ from fastapi.testclient import TestClient
 from app.alchemy_client import NewWalletError, OracleDataError
 from app.main import app, oracle
 from app.scoring import WalletMetrics
+from datetime import datetime, timezone
+from app.features import WalletFeatures
 
 
 client = TestClient(app)
@@ -67,3 +69,84 @@ def test_alchemy_failure_returns_502(monkeypatch):
     response = client.get("/score/0x0000000000000000000000000000000000000001")
     assert response.status_code == 502
     assert response.json()["detail"] == "upstream timeout"
+
+def test_features_endpoint(monkeypatch):
+
+    transfers = [
+        {
+            "hash": "0xabc",
+            "asset": "ETH",
+            "value": 1.5,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T10:00:00Z"
+            },
+        },
+        {
+            "hash": "0xabc",
+            "asset": "DAI",
+            "value": 100,
+            "metadata": {
+                "blockTimestamp":
+                    "2026-01-01T10:00:00Z"
+            },
+        },
+    ]
+
+    monkeypatch.setattr(
+        oracle,
+        "fetch_asset_transfers",
+        lambda _address: transfers,
+    )
+
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    response = client.get(
+        f"/wallet/{address}/features"
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["unique_transaction_count"] == 1
+    assert body["asset_transfer_event_count"] == 2
+    assert body["total_native_eth_transfer_volume"] == 1.5
+
+
+def test_features_endpoint_invalid_address():
+
+    response = client.get(
+        "/wallet/not-a-real-address/features"
+    )
+
+    assert response.status_code == 400
+
+
+def test_features_endpoint_provider_failure(monkeypatch):
+
+    def _raise(_address):
+        raise OracleDataError(
+            "upstream timeout"
+        )
+
+    monkeypatch.setattr(
+        oracle,
+        "fetch_asset_transfers",
+        _raise,
+    )
+
+    address = (
+        "0x0000000000000000000000000000000000000001"
+    )
+
+    response = client.get(
+        f"/wallet/{address}/features"
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "upstream timeout"
+    )
