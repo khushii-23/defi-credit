@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
@@ -8,93 +7,25 @@ from alchemy.exceptions import AlchemyError
 from web3 import Web3
 
 from app.config import MAX_TRANSFER_PAGES, TRANSFER_PAGE_SIZE
-from app.protocols import PROTOCOL_BY_ADDRESS
-from app.scoring import WalletMetrics
 
-# String categories: alchemy-sdk's ERC20 enum member is a 1-tuple because of a trailing comma.
 TRANSFER_CATEGORIES = ["external", "internal", "erc20"]
-
-NETWORK_BY_NAME = {
-    "eth-mainnet": Network.ETH_MAINNET,
-    "eth_mainnet": Network.ETH_MAINNET,
-}
-
 
 class OracleDataError(Exception):
     """Raised when Alchemy cannot return wallet history."""
 
-
-class NewWalletError(Exception):
-    """Raised when the address has no on-chain history."""
-
-    def __init__(self, address: str) -> None:
-        self.address = address
-        super().__init__(f"Wallet {address} has no on-chain history")
-
-
-def _parse_timestamp(value: str) -> datetime:
-    cleaned = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(cleaned)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _transfer_counterparty(transfer: Any, wallet: str) -> Optional[str]:
-    wallet_lc = wallet.lower()
-    frm = getattr(transfer, "frm", "") or ""
-    to = getattr(transfer, "to", None) or ""
-    if frm.lower() == wallet_lc and to:
-        return to
-    if to.lower() == wallet_lc and frm:
-        return frm
-    return to or frm or None
-
-
 def _iter_transfers(payload: dict) -> Iterable[Any]:
     return payload.get("transfers") or []
-
 
 class AlchemyOracle:
     def __init__(self, api_key: str, network: Network = Network.ETH_MAINNET) -> None:
         self.client = Alchemy(api_key=api_key, network=network, max_retries=3)
-
-    def _first_transfer_time(
-        self, address: str, *, inbound: bool
-    ) -> Optional[datetime]:
-        kwargs: dict[str, Any] = {
-            "category": TRANSFER_CATEGORIES,
-            "with_metadata": True,
-            "from_block": "0x0",
-            "order": "asc",
-            "max_count": 1,
-            "exclude_zero_value": False,
-        }
-        if inbound:
-            kwargs["to_address"] = address
-        else:
-            kwargs["from_address"] = address
-
-        try:
-            result = self.client.core.get_asset_transfers(**kwargs)
-        except AlchemyError as exc:
-            raise OracleDataError(str(exc)) from exc
-
-        transfers = list(_iter_transfers(result))
-        if not transfers:
-            return None
-        metadata = getattr(transfers[0], "metadata", None)
-        ts = getattr(metadata, "block_timestamp", None) if metadata else None
-        if not ts:
-            return None
-        return _parse_timestamp(ts)
 
     def _paged_transfers(self, address: str, *, inbound: bool) -> list[Any]:
         collected: list[Any] = []
         page_key: Optional[str] = None
         kwargs_base: dict[str, Any] = {
             "category": TRANSFER_CATEGORIES,
-            "with_metadata": False,
+            "with_metadata": True,
             "from_block": "0x0",
             "order": "asc",
             "max_count": TRANSFER_PAGE_SIZE,
@@ -121,154 +52,59 @@ class AlchemyOracle:
         return collected
 
     def fetch_asset_transfers(self, address: str) -> list[dict]:
-        """
-        Fetch inbound and outbound asset transfers and convert
-        Alchemy SDK objects into plain dictionaries.
-        """
-
         checksum = Web3.to_checksum_address(address)
-
-        outbound = self._paged_transfers(
-            checksum,
-            inbound=False,
-        )
-
-        inbound = self._paged_transfers(
-            checksum,
-            inbound=True,
-        )
-
+        outbound = self._paged_transfers(checksum, inbound=False)
+        inbound = self._paged_transfers(checksum, inbound=True)
         transfers = outbound + inbound
-
         normalized_transfers = []
-
+        
         for transfer in transfers:
-            metadata = getattr(
-                transfer,
-                "metadata",
-                None,
-            )
-
+            metadata = getattr(transfer, "metadata", None)
             block_timestamp = None
-
             if metadata:
-                block_timestamp = getattr(
-                    metadata,
-                    "block_timestamp",
-                    None,
-                )
-
-            normalized_transfers.append(
-                {
-                    "hash": getattr(transfer, "hash", None),
-                    "from": getattr(transfer, "frm", None),
-                    "to": getattr(transfer, "to", None),
-                    "asset": getattr(transfer, "asset", None),
-                    "value": getattr(transfer, "value", None),
-                    "category": getattr(transfer, "category", None),
-                    "metadata": {
-                        "blockTimestamp": block_timestamp,
-                    },
-                }
-            )
-
+                block_timestamp = getattr(metadata, "block_timestamp", None)
+            normalized_transfers.append({
+                "hash": getattr(transfer, "hash", None),
+                "from": getattr(transfer, "frm", None),
+                "to": getattr(transfer, "to", None),
+                "asset": getattr(transfer, "asset", None),
+                "value": getattr(transfer, "value", None),
+                "category": getattr(transfer, "category", None),
+                "metadata": {"blockTimestamp": block_timestamp},
+            })
         return normalized_transfers
-    def fetch_metrics(self, address: str) -> WalletMetrics:
-        checksum = Web3.to_checksum_address(address)
 
+    def fetch_transaction_receipt(self, tx_hash: str) -> Optional[dict]:
+        """Fetch a single transaction receipt and convert to a normalized dictionary."""
         try:
-            nonce = self.client.core.get_transaction_count(checksum)
+            receipt = self.client.core.get_transaction_receipt(tx_hash)
+            if not receipt:
+                return None
+            
+            logs = getattr(receipt, "logs", [])
+            normalized_logs = []
+            
+            for log in logs:
+                normalized_topics = []
+                for topic in getattr(log, "topics", []):
+                    # Handle Web3 HexBytes gracefully for our stateless decoder
+                    if hasattr(topic, "hex"):
+                        normalized_topics.append(topic.hex())
+                    else:
+                        normalized_topics.append(str(topic))
+
+                normalized_logs.append({
+                    "address": getattr(log, "address", ""),
+                    "topics": normalized_topics,
+                    "data": getattr(log, "data", ""),
+                })
+            
+            return {
+                "transactionHash": getattr(receipt, "transactionHash", tx_hash),
+                "logs": normalized_logs
+            }
+            
+        except AlchemyError as exc:
+            raise OracleDataError(f"Failed to fetch receipt for {tx_hash}: {exc}") from exc
         except Exception as exc:
-            raise OracleDataError(
-                f"Failed to read transaction count: {exc}"
-            ) from exc
-
-        first_out = self._first_transfer_time(
-            checksum,
-            inbound=False,
-        )
-
-        first_in = self._first_transfer_time(
-            checksum,
-            inbound=True,
-        )
-
-        firsts = [
-            ts
-            for ts in (first_out, first_in)
-            if ts is not None
-        ]
-
-        outbound = self._paged_transfers(
-            checksum,
-            inbound=False,
-        )
-
-        inbound = self._paged_transfers(
-            checksum,
-            inbound=True,
-        )
-
-        transfers = outbound + inbound
-
-        unique_hashes = {
-            getattr(t, "hash", None)
-            for t in transfers
-        }
-
-        unique_hashes.discard(None)
-
-        tx_count = max(
-            int(nonce),
-            len(unique_hashes),
-        )
-
-        if not firsts and tx_count == 0:
-            raise NewWalletError(checksum)
-
-        if firsts:
-            age_days = (
-                datetime.now(timezone.utc) - min(firsts)
-            ).total_seconds() / 86400
-        else:
-            age_days = 0.0
-
-        protocols: set[str] = set()
-        defi_hashes: set[str] = set()
-
-        for transfer in transfers:
-            counterparty = _transfer_counterparty(
-                transfer,
-                checksum,
-            )
-
-            if not counterparty:
-                continue
-
-            try:
-                keyed = Web3.to_checksum_address(
-                    counterparty
-                )
-            except ValueError:
-                continue
-
-            protocol = PROTOCOL_BY_ADDRESS.get(keyed)
-
-            if protocol:
-                protocols.add(protocol)
-
-                tx_hash = getattr(
-                    transfer,
-                    "hash",
-                    None,
-                )
-
-                if tx_hash:
-                    defi_hashes.add(tx_hash)
-
-        return WalletMetrics(
-            account_age_days=max(age_days, 0.0),
-            transaction_count=tx_count,
-            defi_interaction_count=len(defi_hashes),
-            protocols_used=tuple(sorted(protocols)),
-        )
+            raise OracleDataError(f"Provider error fetching receipt for {tx_hash}: {exc}") from exc

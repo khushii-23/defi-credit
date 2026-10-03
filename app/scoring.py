@@ -1,58 +1,122 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from math import log1p
-
-from app.config import (
-    AGE_DAYS_CAP,
-    DEFI_COUNT_CAP,
-    SCORE_MAX,
-    SCORE_MIN,
-    TX_COUNT_CAP,
-    WEIGHT_ACCOUNT_AGE,
-    WEIGHT_DEFI,
-    WEIGHT_TX_COUNT,
-)
+from app.config import SCORE_MAX, SCORE_MIN
+from app.models import WalletFeatures
 
 
-@dataclass(frozen=True)
-class WalletMetrics:
-    account_age_days: float
-    transaction_count: int
-    defi_interaction_count: int
-    protocols_used: tuple[str, ...] = ()
+def _clamp(value: float, min_val: float, max_val: float) -> float:
+    return max(min_val, min(max_val, value))
 
 
-def _clamp01(value: float) -> float:
-    return max(0.0, min(1.0, value))
+def compute_risk_score(features: WalletFeatures) -> tuple[int, list[dict]]:
+    """Task 3 & 4: Risk-Adjusted Scoring Engine & Explainability Layer.
 
+    Computes a risk-adjusted score using Phase 2 metrics and generates
+    explainable factors. Returns: (score, explanations)
+    """
+    if features.unique_transaction_count == 0:
+        return SCORE_MIN, [
+            {
+                "factor": "No History",
+                "impact": "neutral",
+                "description": "Wallet has no on-chain transactions.",
+            }
+        ]
 
-def normalize_account_age(days: float) -> float:
-    return _clamp01(days / AGE_DAYS_CAP)
+    base_score = 300
+    points = 0.0
+    explanations: list[dict] = []
 
+    # 1. Account Age (Up to 150 points) - ONLY awarded if wallet actively uses DeFi
+    age_points = _clamp((features.wallet_age_days / 365.0) * 150.0, 0.0, 150.0)
+    if features.defi_transaction_count > 0:
+        points += age_points
+        if age_points > 50.0:
+            explanations.append(
+                {
+                    "factor": "Account Age",
+                    "impact": "positive",
+                    "description": f"Wallet active for {int(features.wallet_age_days)} days.",
+                }
+            )
+        else:
+            explanations.append(
+                {
+                    "factor": "Account Age",
+                    "impact": "negative",
+                    "description": "Relatively new wallet history.",
+                }
+            )
+    else:
+        explanations.append(
+            {
+                "factor": "Account Age",
+                "impact": "neutral",
+                "description": "Age ignored due to lack of DeFi engagement.",
+            }
+        )
 
-def normalize_tx_count(count: int) -> float:
-    # Log scale so a handful of txs still score, while whales saturate at the cap.
-    return _clamp01(log1p(count) / log1p(TX_COUNT_CAP))
+    # 2. DeFi Activity (Up to 150 points)
+    defi_tx = features.defi_transaction_count
+    defi_points = _clamp(defi_tx * 3.0, 0.0, 150.0)
+    points += defi_points
+    if defi_points > 0.0:
+        explanations.append(
+            {
+                "factor": "DeFi Engagement",
+                "impact": "positive",
+                "description": f"Executed {defi_tx} DeFi transactions.",
+            }
+        )
 
+    # 3. Lending Behavior (Phase 2B Metrics)
+    repay_bonus = _clamp(features.repayment_count * 25.0, 0.0, 150.0)
+    deposit_bonus = _clamp(features.deposit_count * 15.0, 0.0, 100.0)
 
-def normalize_defi_count(count: int) -> float:
-    return _clamp01(log1p(count) / log1p(DEFI_COUNT_CAP))
+    if repay_bonus > 0.0:
+        points += repay_bonus
+        explanations.append(
+            {
+                "factor": "Loan Repayment",
+                "impact": "positive",
+                "description": f"Detected {features.repayment_count} protocol repayments.",
+            }
+        )
+    if deposit_bonus > 0.0:
+        points += deposit_bonus
+        explanations.append(
+            {
+                "factor": "Collateral Supply",
+                "impact": "positive",
+                "description": f"Detected {features.deposit_count} protocol deposits.",
+            }
+        )
 
+    # Penalties (Liquidations severely impact score)
+    liquidation_penalty = _clamp(features.liquidation_count * 200.0, 0.0, 500.0)
+    if liquidation_penalty > 0.0:
+        points -= liquidation_penalty
+        explanations.append(
+            {
+                "factor": "Liquidations",
+                "impact": "negative",
+                "description": f"High risk: Detected {features.liquidation_count} liquidation events.",
+            }
+        )
 
-def compute_score(metrics: WalletMetrics) -> int:
-    """Map normalized, weighted metrics onto the closed interval [300, 850]."""
-    if (
-        metrics.account_age_days <= 0
-        and metrics.transaction_count <= 0
-        and metrics.defi_interaction_count <= 0
-    ):
-        return SCORE_MIN
-
-    blended = (
-        WEIGHT_ACCOUNT_AGE * normalize_account_age(metrics.account_age_days)
-        + WEIGHT_TX_COUNT * normalize_tx_count(metrics.transaction_count)
-        + WEIGHT_DEFI * normalize_defi_count(metrics.defi_interaction_count)
+    final_score = int(
+        round(_clamp(base_score + points, float(SCORE_MIN), float(SCORE_MAX)))
     )
-    raw = SCORE_MIN + (SCORE_MAX - SCORE_MIN) * blended
-    return int(round(max(SCORE_MIN, min(SCORE_MAX, raw))))
+
+    # HARD CAP: A liquidated wallet cannot have a prime score (> 600)
+    if features.liquidation_count > 0 and final_score > 600:
+        final_score = 600
+        explanations.append(
+            {
+                "factor": "Risk Cap Applied",
+                "impact": "negative",
+                "description": "Score capped at 600 due to historical liquidations.",
+            }
+        )
+
+    return final_score, explanations

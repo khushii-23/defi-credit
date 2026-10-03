@@ -1,54 +1,48 @@
 from app.config import SCORE_MAX, SCORE_MIN
-from app.scoring import (
-    WalletMetrics,
-    compute_score,
-    normalize_account_age,
-    normalize_defi_count,
-    normalize_tx_count,
-)
+from app.scoring import compute_risk_score
+from app.models import WalletFeatures
 
+def _mock_features(**kwargs) -> WalletFeatures:
+    data = {
+        "wallet_address": "0x0000000000000000000000000000000000000001",
+        "analysis_timestamp": "2026-01-01T00:00:00+00:00"
+    }
+    data.update(kwargs)
+    return WalletFeatures(**data)
 
 def test_new_wallet_scores_minimum():
-    metrics = WalletMetrics(
-        account_age_days=0, transaction_count=0, defi_interaction_count=0
-    )
-    assert compute_score(metrics) == SCORE_MIN
-
+    features = _mock_features(unique_transaction_count=0)
+    score, _ = compute_risk_score(features)
+    assert score == SCORE_MIN
 
 def test_saturated_metrics_hit_max_score():
-    metrics = WalletMetrics(
-        account_age_days=10_000,
-        transaction_count=10_000,
-        defi_interaction_count=10_000,
+    features = _mock_features(
+        unique_transaction_count=1000,
+        wallet_age_days=1000,
+        defi_transaction_count=500,
+        repayment_count=50,
+        deposit_count=50,
+        liquidation_count=0
     )
-    assert compute_score(metrics) == SCORE_MAX
-
+    score, _ = compute_risk_score(features)
+    assert score == SCORE_MAX
 
 def test_score_is_monotonic_in_each_feature():
-    base = WalletMetrics(
-        account_age_days=30, transaction_count=10, defi_interaction_count=2
-    )
-    older = WalletMetrics(
-        account_age_days=365, transaction_count=10, defi_interaction_count=2
-    )
-    busier = WalletMetrics(
-        account_age_days=30, transaction_count=200, defi_interaction_count=2
-    )
-    more_defi = WalletMetrics(
-        account_age_days=30, transaction_count=10, defi_interaction_count=40
-    )
-    floor = compute_score(base)
-    assert compute_score(older) > floor
-    assert compute_score(busier) > floor
-    assert compute_score(more_defi) > floor
-    assert SCORE_MIN < floor < SCORE_MAX
+    base = _mock_features(unique_transaction_count=10, wallet_age_days=30, defi_transaction_count=2, repayment_count=0)
+    older = _mock_features(unique_transaction_count=10, wallet_age_days=365, defi_transaction_count=2, repayment_count=0)
+    more_defi = _mock_features(unique_transaction_count=10, wallet_age_days=30, defi_transaction_count=20, repayment_count=0)
+    repayments = _mock_features(unique_transaction_count=10, wallet_age_days=30, defi_transaction_count=2, repayment_count=5)
+    
+    floor, _ = compute_risk_score(base)
+    assert compute_risk_score(older)[0] > floor
+    assert compute_risk_score(more_defi)[0] > floor
+    assert compute_risk_score(repayments)[0] > floor
 
-
-def test_normalizers_are_bounded():
-    assert normalize_account_age(-1) == 0
-    assert normalize_account_age(0) == 0
-    assert normalize_account_age(10_000) == 1
-    assert 0 < normalize_tx_count(1) < 1
-    assert normalize_tx_count(0) == 0
-    assert normalize_defi_count(0) == 0
-    assert normalize_defi_count(10_000) == 1
+def test_liquidations_penalize_score():
+    healthy = _mock_features(unique_transaction_count=10, wallet_age_days=365, repayment_count=10, liquidation_count=0)
+    liquidated = _mock_features(unique_transaction_count=10, wallet_age_days=365, repayment_count=10, liquidation_count=2)
+    
+    healthy_score, _ = compute_risk_score(healthy)
+    liquidated_score, _ = compute_risk_score(liquidated)
+    
+    assert liquidated_score < healthy_score

@@ -48,5 +48,18 @@ AI assistants should inspect the current repository before making assumptions ab
 
 Maintain project-level context in:
 
-```text
+text
 docs/PROJECT_CONTEXT.md
+
+## D003 — Log-Level Event Decoding for DeFi Action Classification
+
+**Date:** 2026-10-02
+
+**Decision:**
+Do not infer financial actions (borrow, repay, supply, liquidate) from asset transfer events or contract interactions alone. Require receipt-level log inspection (`topics[0]` Keccak-256 event signatures) and participant matching against official protocol ABIs (starting with Aave V3 Pool).
+
+**Reason:**
+A transfer to a lending pool address can represent a deposit, a debt repayment, or a flash loan return. Classifying actions without event log evidence is methodologically indefensible.
+
+**Implication:**
+Lending transactions are deduplicated by hash, receipts are retrieved on-demand via the RPC layer, and unmapped/unsupported logs are classified as `unknown` or ignored if irrelevant (e.g., standard ERC-20 transfers).
