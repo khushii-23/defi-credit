@@ -38,3 +38,16 @@
     { "address": "0x000000000000000000000000000000000000dead", "label": "Dead Burn Address" }
   ]
 }
+{
+  "active_borrowers": [
+    "0xPrimeWalletAddress1...", 
+    "0xPrimeWalletAddress2..."
+  ],
+  "liquidated_wallets": [
+    "0xLiquidatedWallet1...", 
+    "0xLiquidatedWallet2..."
+  ],
+  "dormant_wallets": [
+    "0xDormantWallet1..."
+  ]
+}

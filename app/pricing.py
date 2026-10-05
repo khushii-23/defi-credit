@@ -15,7 +15,6 @@ ASSET_META = {
 def raw_to_usd(asset_addr: str, amount_raw: int, price_usd: Optional[float] = None) -> float:
     addr = asset_addr.lower()
     if addr not in ASSET_META:
-        # Default fallback for unknown tokens: assume 18 decimals and $1.00
         return float(amount_raw) / 1e18
     
     symbol, decimals, fallback_price = ASSET_META[addr]
