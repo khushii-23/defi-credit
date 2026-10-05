@@ -1,43 +1,4 @@
-{
-  "healthy_borrowers": [
-    { "address": "0x47ac0Fb4F2D84898e4D9E7b4DaB3C24507a6D503", "label": "Healthy 01" },
-    { "address": "0x56178a0d5F301bAf6CF3c1Cd7de05244F437b4f1", "label": "Healthy 02" },
-    { "address": "0x28C6c06298d514Db089934071355E5743bf21d60", "label": "Healthy 03" },
-    { "address": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640", "label": "Healthy 04" },
-    { "address": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "label": "Healthy 05" },
-    { "address": "0x1111111254fb6c44bac0bed2854e76f90643097d", "label": "Healthy 06" },
-    { "address": "0x000000000000084e91743124a982076c59f10084", "label": "Healthy 07" },
-    { "address": "0x9c5083dd4838e120dbeac44c052179692aa5dac5", "label": "Healthy 08" },
-    { "address": "0x3f5ce5fbfe3e9af3971dd833d26ba9b5c936f0be", "label": "Healthy 09" },
-    { "address": "0x6cc5f688a315f3dc28a7781717a9a798a59fda7b", "label": "Healthy 10" },
-    { "address": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045", "label": "Healthy 11" },
-    { "address": "0x5a52e96bacdabb82fd05763e25335261b270efcb", "label": "Healthy 12" },
-    { "address": "0x1b3cb81e51011b549d78bf720b0d924ac763a7c2", "label": "Healthy 13" },
-    { "address": "0x829bd824b016326a401d083b33d092293333a830", "label": "Healthy 14" },
-    { "address": "0xab5801a7d398351b8be11c439e05c5b3259aec9b", "label": "Healthy 15" }
-  ],
-  "liquidated_borrowers": [
-    { "address": "0x539b699a22cc3091df2e1d7cf9d560c554eecdc8", "label": "Liquidated 01" },
-    { "address": "0x8eb8a3b98659cce2304611163cc33405953f0043", "label": "Liquidated 02" },
-    { "address": "0x7890789078907890789078907890789078907890", "label": "Liquidated 03" },
-    { "address": "0x6b75d8af000000e20b7a7ddf000ba900b4009a80", "label": "Liquidated 04" },
-    { "address": "0x1234567890123456789012345678901234567890", "label": "Liquidated 05" },
-    { "address": "0xd90e2f925da726b50c4ed8d0fb90ad053324f31b", "label": "Liquidated 06" },
-    { "address": "0x70b17b2b73010b904e6c38217bb66488d5e1ecbc", "label": "Liquidated 07" },
-    { "address": "0x23a51d53086eb16260ab921c548da968038e8e7a", "label": "Liquidated 08" },
-    { "address": "0xa69babef1ca67a37ffaf7a485dfff3382056e78c", "label": "Liquidated 09" },
-    { "address": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc", "label": "Liquidated 10" },
-    { "address": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc", "label": "Liquidated 11" },
-    { "address": "0x85050f24950e325619daaa8b1a8fbb2ec1a1bc63", "label": "Liquidated 12" },
-    { "address": "0x9bf4001d307dfd62b26a2f1307ee0c0307632d59", "label": "Liquidated 13" },
-    { "address": "0x28c6c06298d514db089934071355e5743bf21d60", "label": "Liquidated 14" },
-    { "address": "0x5d3a536e4d6dbd6114cc1ead35777bab948e3643", "label": "Liquidated 15" }
-  ],
-  "inactive_wallets": [
-    { "address": "0x0000000000000000000000000000000000000001", "label": "Precompile / Burn Address" },
-    { "address": "0x000000000000000000000000000000000000dead", "label": "Dead Burn Address" }
-  ]
-}
+
 {
   "active_borrowers": [
     "0xPrimeWalletAddress1...", 

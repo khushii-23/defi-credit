@@ -1,10 +1,14 @@
-import json
+import sys
 import os
+import json
 from dotenv import load_dotenv
+
+# Add the project root directory to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from app.decoder import fetch_logs, decode_log, populate_block_timestamps, BLOCK_TIME_CACHE
 from app.pricing import raw_to_usd
 
-# Load environment variables
 load_dotenv()
 ALCHEMY_URL = os.getenv("ALCHEMY_URL")
 
@@ -16,7 +20,6 @@ def main():
     with open("scripts/cohorts.json", "r") as f:
         cohorts = json.load(f)
 
-    # Flatten all wallets to lowercase for exact matching
     all_wallets = []
     for group in cohorts.values():
         all_wallets.extend([w.lower() for w in group])
@@ -30,12 +33,11 @@ def main():
 
     all_decoded_events = []
 
-    # 3. Fetch logs for each event type using our adaptive decoder
+    # 3. Fetch logs for each event type
     event_types = ["Supply", "Borrow", "Repay", "LiquidationCall"]
     
     for kind in event_types:
         print(f"Fetching {kind} events...")
-        # fetch_logs will automatically halve the chunk size if Alchemy throws a limit error
         raw_logs = fetch_logs(
             url=ALCHEMY_URL,
             kind=kind,
@@ -45,7 +47,6 @@ def main():
             chunk=100000 
         )
         
-        # Decode logs
         for log in raw_logs:
             event = decode_log(log)
             if event and event.account in all_wallets:
@@ -53,12 +54,12 @@ def main():
 
     print(f"Decoded {len(all_decoded_events)} relevant events.")
 
-    # 4. Batch fetch block timestamps to avoid thousands of individual RPC calls
+    # 4. Batch fetch block timestamps
     unique_blocks = {e.block for e in all_decoded_events}
     print(f"Batch fetching timestamps for {len(unique_blocks)} unique blocks...")
     populate_block_timestamps(ALCHEMY_URL, unique_blocks)
 
-    # 5. Format for the scoring engine and apply USD conversions
+    # 5. Format for the scoring engine
     final_events = []
     for e in all_decoded_events:
         ts = BLOCK_TIME_CACHE.get(e.block, 0)
@@ -72,7 +73,7 @@ def main():
             "account": e.account
         })
 
-    # 6. Save to disk for evaluate_cohorts.py
+    # 6. Save to disk
     out_file = "scripts/extracted_events.json"
     with open(out_file, "w") as f:
         json.dump(final_events, f, indent=2)
