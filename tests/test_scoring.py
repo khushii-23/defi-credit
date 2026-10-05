@@ -49,7 +49,7 @@ def test_thin_file_gate():
     assert score([], far, Config(thin_file_gate=False)).components["age"] == 0  # no events at all: nothing to age
 
 def test_cap_is_vacuous_under_paper_weights():
-    # Force original V1 weights to prove the mathematical flaw, in case app/scoring.py defaults to V2
+    # Force original V1 weights to prove the mathematical flaw
     cfg = Config(base=300, repay_cap=150, supply_cap=60, month_cap=60, age_cap=60, liq_penalty=200, liq_cap_score=600)
     assert max_raw_with_liquidations(cfg, 1) == 430 < cfg.liq_cap_score
     assert max_raw_with_liquidations(cfg, 0) == 630

@@ -1,22 +1,13 @@
-"""Decoding validation (paper Section 4.2).
-
-Ours:        list[decoder.Event]
-Independent: CSV exported from the Aave V3 subgraph or Dune with columns
-             tx_hash, log_index, event, account
-(In the subgraph, supply/borrow/repay/liquidationCall entities carry the tx hash
-and a log-index-bearing id; export them to this shape.)
-"""
+"""Decoding validation (paper Section 4.2)."""
 from __future__ import annotations
 import csv
 from collections import Counter
 from .decoder import Event
 
-
 def load_independent(path: str) -> set[tuple]:
     with open(path, newline="") as f:
         return {(r["tx_hash"].lower(), int(r["log_index"]), r["event"], r["account"].lower())
                 for r in csv.DictReader(f)}
-
 
 def compare(ours: list[Event], indep: set[tuple]) -> dict:
     mine = {(e.tx_hash, e.log_index, e.kind, e.account) for e in ours}
@@ -37,7 +28,7 @@ def compare(ours: list[Event], indep: set[tuple]) -> dict:
     return {
         "ours": len(mine), "independent": len(indep), "matched": len(tp),
         "precision": precision, "recall": recall, "exact_count_agreement": exact,
-        "only_ours": sorted(mine - indep)[:50],          # inspect every discrepancy
+        "only_ours": sorted(mine - indep)[:50],          
         "only_independent": sorted(indep - mine)[:50],
         "attribution_mismatches": len(wrong_account),
     }
