@@ -1,6 +1,3 @@
-Here is the complete `README.md` file formatted in standard GitHub Markdown.
-
-I have placed it inside a code block so you can simply click the **"Copy code"** button in the top right corner and paste it directly into your project's `README.md` file.
 
 ```markdown
 # 📊 DeFi Credit Scoring Engine
