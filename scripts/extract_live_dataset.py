@@ -3,7 +3,7 @@ import json
 from dotenv import load_dotenv
 from web3 import Web3
 
-# Load Alchemy Key
+# Load Alchemy Key to know more
 load_dotenv()
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 if not ALCHEMY_API_KEY or ALCHEMY_API_KEY == "demo":
