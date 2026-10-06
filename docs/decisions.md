@@ -63,3 +63,5 @@ A transfer to a lending pool address can represent a deposit, a debt repayment, 
 
 **Implication:**
 Lending transactions are deduplicated by hash, receipts are retrieved on-demand via the RPC layer, and unmapped/unsupported logs are classified as `unknown` or ignored if irrelevant (e.g., standard ERC-20 transfers).
+
+finallly its fully done and will be deployed soon
