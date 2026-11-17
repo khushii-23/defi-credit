@@ -131,12 +131,5 @@ defi-credit-scoring/
 ├── score_distribution_chart.png# Auto-generated evaluation box plot
 └── README.md
 
-```
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-```
 
 ```
